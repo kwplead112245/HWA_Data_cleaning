@@ -4,7 +4,7 @@ Haywood Waterways Master Data Consolidation Script
 Cross-references 6+ source CSVs to produce import-ready CSVs
 for the haywood_waterways PostgreSQL database.
 """
-
+from fuzzywuzzy import fuzz
 import pandas as pd
 import numpy as np
 import re
@@ -316,6 +316,47 @@ def parse_concatenated_names(fname, lname, spousesname=None):
         people.append({'first_name': sp[0], 'last_name': ' '.join(sp[1:]) if len(sp)>1 else (people[0]['last_name'] if people else '')})
     return people
 
+
+class FuzzyMatcher:
+    """Enhanced matching logic for emails, addresses, and names."""
+
+    def __init__(self, email_threshold=85, address_threshold=80):
+        self.email_threshold = email_threshold
+        self.address_threshold = address_threshold
+
+    @staticmethod
+    def extract_email_domain(email):
+        if not email or '@' not in str(email): return None
+        return str(email).split('@')[-1].lower().strip()
+
+    @staticmethod
+    def extract_email_localpart(email):
+        if not email or '@' not in str(email): return None
+        return str(email).split('@')[0].lower().strip()
+
+    def emails_match(self, email1, email2):
+        if not email1 or not email2: return False, 0
+        e1, e2 = str(email1).lower().strip(), str(email2).lower().strip()
+        if e1 == e2: return True, 100
+
+        domain1, domain2 = self.extract_email_domain(e1), self.extract_email_domain(e2)
+        local1, local2 = self.extract_email_localpart(e1), self.extract_email_localpart(e2)
+
+        if domain1 and domain2 and domain1 == domain2:
+            local_score = fuzz.ratio(local1, local2)
+            if local_score >= self.email_threshold: return True, local_score
+
+        full_score = fuzz.ratio(e1, e2)
+        return (full_score >= self.email_threshold, full_score)
+
+    def addresses_fuzzy_match(self, addr1, city1, addr2, city2):
+        if not addr1 or not addr2 or not city1 or not city2: return False, 0
+        a1, c1 = str(addr1).lower().strip(), str(city1).lower().strip()
+        a2, c2 = str(addr2).lower().strip(), str(city2).lower().strip()
+
+        if fuzz.ratio(c1, c2) < 90: return False, 0
+        street_score = fuzz.token_sort_ratio(a1, a2)
+        return street_score >= self.address_threshold, street_score
 # ============================================================================
 # MASTER CONSOLIDATOR
 # ============================================================================
@@ -325,6 +366,9 @@ class MasterConsolidator:
         self.config = config
         self.SCORING = config.SCORING
         self.warnings = []
+
+        self.fuzzy_matcher = FuzzyMatcher()
+
 
         # Load Manual Resolutions
         self.resolutions = {}
@@ -369,105 +413,78 @@ class MasterConsolidator:
         return self._donation_id
 
     def find_person(self, first_name, last_name, email=None, phone=None, zip_code=None, address_line1=None, city=None):
-        scores = self.SCORING
-        auto_threshold = self.config.AUTO_MERGE_THRESHOLD
-        review_threshold = self.config.REVIEW_THRESHOLD
+        e_clean = clean_email(email)
+        a_norm = self._normalize_address(address_line1, city)
+        ph_norm = self._normalize_phone_digits(phone)
+        fn = normalize_name_for_matching(first_name)
+        ln = normalize_name_for_matching(last_name)
 
-        email_clean = clean_email(email)
-        addr_norm = self._normalize_address(address_line1, city)
-        ph_digits = self._normalize_phone_digits(phone)
-        fn, ln = normalize_name_for_matching(first_name), normalize_name_for_matching(last_name)
-        has_contact_info = bool(addr_norm or email_clean or ph_digits)
-
+        # --- PHASE 1: EXACT MATCHING (FAST) ---
         candidates = set()
-        if addr_norm and addr_norm in self._address_index: candidates.update(self._address_index[addr_norm])
-        if email_clean and email_clean in self.email_index: candidates.add(self.email_index[email_clean])
-        if ph_digits and ph_digits in self._phone_index: candidates.update(self._phone_index[ph_digits])
-        if fn and ln and f"{fn}:{ln}" in self.name_index: candidates.update(self.name_index[f"{fn}:{ln}"])
+        if e_clean and e_clean in self.email_index:
+            candidates.add(self.email_index[e_clean])
+        if address_line1 and city:
+            # Check against the new name
+            is_match, conf = self.fuzzy_matcher.addresses_fuzzy_match(
+                address_line1, city,
+                person.get('address_line1'), person.get('city')
+            )
+        if f"{fn}:{ln}" in self.name_index:
+            candidates.update(self.name_index[f"{fn}:{ln}"])
 
-        if not candidates: return None, 0
-
-        best_key, best_score, best_breakdown = None, 0, {}
-
+        best_key, best_score = None, 0
         for pk in candidates:
             person = self.people[pk]
             score = 0
-            breakdown = {}
+            if e_clean and (e_clean == person.get('email')): score += 50
+            if a_norm and a_norm == self._normalize_address(person.get('address_line1'),
+                                                            person.get('city')): score += 40
+            if fn == normalize_name_for_matching(person.get('first_name')) and ln == normalize_name_for_matching(
+                person.get('last_name')): score += 20
+            if score > best_score: best_score, best_key = score, pk
 
-            if addr_norm and addr_norm == self._normalize_address(person.get('address_line1'), person.get('city')):
-                score += scores['address_match']
-                breakdown['address'] = scores['address_match']
+        # If we found a strong exact match, return it
+        if best_score >= 50: return best_key, best_score
 
-            if email_clean and (email_clean == person.get('email') or email_clean in person.get('_all_emails', set())):
-                score += scores['email_match']
-                breakdown['email'] = scores['email_match']
+        # --- PHASE 2: FUZZY MATCHING (THE "SAFETY NET") ---
+        # Only runs if Phase 1 didn't find a high-confidence match
+        if not best_key and (fn or ln or e_clean):
+            for pk, person in self.people.items():
+                f_score = 0
 
-            if ph_digits and ph_digits == self._normalize_phone_digits(person.get('phone')):
-                score += scores['phone_match']
-                breakdown['phone'] = scores['phone_match']
+                # Fuzzy Name Check (Token Sort handles "Smith, John" vs "John Smith")
+                full_name_new = f"{fn} {ln}"
+                full_name_ext = f"{normalize_name_for_matching(person['first_name'])} {normalize_name_for_matching(person['last_name'])}"
+                name_fuzz = fuzz.token_sort_ratio(full_name_new, full_name_ext)
 
-            if fn and ln:
-                existing_fn = normalize_name_for_matching(person.get('first_name', ''))
-                existing_ln = normalize_name_for_matching(person.get('last_name', ''))
+                # Fuzzy Email Check
+                email_fuzz = 0
+                if e_clean and person.get('email'):
+                    email_fuzz = fuzz.ratio(e_clean, person['email'])
 
-                if fn == existing_fn and ln == existing_ln:
-                    score += scores['name_exact']
-                    breakdown['name_exact'] = scores['name_exact']
+                # Weighted Score
+                if name_fuzz > 90: f_score += 30
+                if email_fuzz > 90: f_score += 50
 
-                    existing_has_contact = bool(person.get('email') or person.get('phone') or person.get('address_line1'))
-                    if not has_contact_info and not existing_has_contact:
-                        score = max(score, auto_threshold)
-                        breakdown['override'] = 'exact_name_neither_has_contact'
-                    elif not has_contact_info or not existing_has_contact:
-                        score = max(score, auto_threshold)
-                        breakdown['override'] = 'exact_name_one_blank_no_conflict'
+                if f_score > best_score:
+                    best_score, best_key = f_score, pk
 
-                elif ln == existing_ln and fn and existing_fn and fn[0] == existing_fn[0]:
-                    score += scores['name_similar']
-                    breakdown['name_similar'] = scores['name_similar']
+        # Threshold Decisions
+        if best_score >= 50: return best_key, best_score
 
-                elif ln == existing_ln and fn != existing_fn:
-                    score = 0
-                    breakdown['override'] = 'family_member_shared_info'
-
-            if score > best_score:
-                best_score = score
-                best_key = pk
-                best_breakdown = breakdown
-
-        if best_score >= auto_threshold:
-            return best_key, best_score
-        elif best_score >= review_threshold:
+        # If it's a "maybe", log it for review
+        if best_score >= 15:
             person = self.people[best_key]
-            warning_id = f"REVIEW_NEEDED_{person.get('donor_id')}_{len(self.warnings)}"
-
-            # --- RESOLUTION ENGINE INTERCEPT ---
-            if warning_id in self.resolutions:
-                action = self.resolutions[warning_id].get('action')
-                if action == 'merge': return best_key, 100
-                elif action == 'separate': return None, 0
-                elif action == 'merge_and_affiliate':
-                    org_name = self.resolutions[warning_id].get('org_name')
-                    person['_pending_affiliations'] = person.get('_pending_affiliations', [])
-                    person['_pending_affiliations'].append(org_name)
-                    return best_key, 100
+            w_id = f"REVIEW_NEEDED_{person['donor_id']}_{len(self.warnings)}"
+            if w_id in self.resolutions:
+                if self.resolutions[w_id].get('action') == 'merge': return best_key, 100
 
             self.warnings.append({
                 'type': 'REVIEW_NEEDED',
-                'confidence_score': best_score,
-                'score_breakdown': str(best_breakdown),
-                'message': f"Score {best_score}: '{first_name} {last_name}' might be '{person.get('first_name')} {person.get('last_name')}'",
-                'new_email': email_clean,
-                'new_phone': clean_phone(phone),
-                'new_address': clean_string(address_line1),
-                'existing_donor_id': person.get('donor_id'),
-                'existing_email': person.get('email'),
-                'existing_phone': person.get('phone'),
-                'existing_address': person.get('address_line1'),
+                'donor_id': person['donor_id'],
+                'message': f"Fuzzy Match ({best_score}%): {first_name} {last_name} vs {person['first_name']} {person['last_name']}"
             })
-            return None, best_score
-        else:
-            return None, best_score
+        return None, best_score
 
     @staticmethod
     def _normalize_address(address_line1, city):
