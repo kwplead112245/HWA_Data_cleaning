@@ -1,40 +1,34 @@
-import numpy as np
+import pandas as pd
+from fuzzywuzzy import fuzz, process
+
+# Email Matching Function
+
+def match_email(email1, email2):
+    """Use simple string matching and domain-level matching for emails"""
+    return email1.lower().strip() == email2.lower().strip() or \
+           email1.split('@')[-1] == email2.split('@')[-1]
 
 
-def levenshtein_distance(s1, s2):
-    if len(s1) < len(s2):
-        return levenshtein_distance(s2, s1)
-    if len(s2) == 0:
-        return len(s1)
-    previous_row = range(len(s2) + 1)
-    for i, c1 in enumerate(s1):
-        current_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = previous_row[j + 1] + 1
-            deletions = current_row[j] + 1
-            substitutions = previous_row[j] + (c1 != c2)
-            current_row.append(min(insertions, deletions, substitutions))
-        previous_row = current_row
-    return previous_row[-1]
+# Address Fuzzy Matching Function
+
+def match_address(address1, address2):
+    """Allow fuzzy matching for addresses using fuzzywuzzy"""
+    return fuzz.token_set_ratio(address1, address2) > 80
 
 
-def fuzzy_address_match(address1, address2, threshold=3):
-    distance = levenshtein_distance(address1, address2)
-    return distance <= threshold
+# Improved `find_person` Logic
+
+def find_person(df, email, address):
+    """Find a person in a DataFrame based on email and address. Uses fuzzy logic for address."""
+    matched = df[(df['email'].apply(match_email, args=(email,)))]
+    if matched.empty:
+        return None
+    # Further match based on address if needed
+    matched = matched[matched['address'].apply(match_address, args=(address,))]  
+    
+    if not matched.empty:
+        return matched.iloc[0]
+    return None
 
 
-def improved_email_matching(email1, email2):
-    email1 = email1.lower().strip()
-    email2 = email2.lower().strip()
-    return email1 == email2 or (email1.replace('.','') == email2.replace('.',''))  # allows . variations
-
-
-# Example Usage
-if __name__ == '__main__':
-    addr1 = "123 Main St"
-    addr2 = "123 Main Street"
-    print(f"Fuzzy address match: {fuzzy_address_match(addr1, addr2)}")
-
-    email1 = "test.email@example.com"
-    email2 = "testemail@example.com"
-    print(f"Improved email match: {improved_email_matching(email1, email2)}")
+# Further improvements might be needed based on use cases and data specifics.
