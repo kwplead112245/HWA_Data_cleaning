@@ -1,0 +1,33 @@
+# Haywood Waterways Data Consolidation - Configuration
+# Place this file in the same directory as master_consolidator.py
+
+directories:
+  input: "C:/Users/katyw/OneDrive/Desktop/HWA/HWA Data/DB/ETL Scripts/input_data"
+  output: "C:/Users/katyw/OneDrive/Desktop/HWA/HWA Data/DB/ETL Scripts/consolidated_output"
+
+# Confidence scoring thresholds
+# auto_merge: Score at or above this → records are automatically merged
+# review: Score between review and auto_merge → separate records, flagged for review
+thresholds:
+  auto_merge: 30
+  review: 15
+
+# Scoring weights — how many points each matching signal is worth
+# Adjust these to tune matching sensitivity
+scoring:
+  address_match: 40     # Same street address + city
+  email_match: 50       # Same email address
+  phone_match: 50       # Same phone number
+  name_exact: 20       # Same name (including nickname resolution: Bill=William)
+  name_similar: 15      # Same last name + similar first name (first initial match)
+
+# Source priority — lower number = more reliable
+# When two sources disagree on a field, the lower-priority-number source wins
+sources:
+  qgiv: 1
+  quickbooks: 1
+  old_names: 2
+  volunteer_db: 3
+  sf_contacts: 4
+  sf_accounts: 5
+  sf_households: 6

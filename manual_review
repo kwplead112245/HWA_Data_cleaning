@@ -1,0 +1,155 @@
+import pandas as pd
+import json
+import os
+import sys
+
+# Configuration
+OUTPUT_DIR = 'consolidated_output'
+WARNINGS_FILE = os.path.join(OUTPUT_DIR, 'consolidation_warnings.csv')
+RESOLUTIONS_FILE = os.path.join(OUTPUT_DIR, 'manual_resolutions.json')
+
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def main():
+    if not os.path.exists(WARNINGS_FILE):
+        print(f"✅ No warnings file found at {WARNINGS_FILE}.")
+        print("Looks like you are good to go! Run your main consolidation script.")
+        return
+
+    try:
+        df = pd.read_csv(WARNINGS_FILE)
+    except Exception as e:
+        print(f"❌ Error reading {WARNINGS_FILE}: {e}")
+        return
+
+    # Filter only actionable warnings
+    actionable_types = ['REVIEW_NEEDED', 'EMAIL_CONFLICT', 'PHONE_CONFLICT', 'ADDRESS_CONFLICT']
+    actionable_df = df[df['type'].isin(actionable_types)]
+
+    if actionable_df.empty:
+        print("✅ No actionable conflicts found in the warnings file.")
+        return
+
+    # Load existing resolutions if any, to allow pausing/resuming
+    resolutions = {}
+    if os.path.exists(RESOLUTIONS_FILE):
+        with open(RESOLUTIONS_FILE, 'r') as f:
+            resolutions = json.load(f)
+
+    print("=====================================================")
+    print(" HAYWOOD WATERWAYS - MANUAL DATA REVIEWER")
+    print("=====================================================")
+    print(f" Found {len(actionable_df)} conflicts requiring your attention.\n")
+
+    input(" Press Enter to begin reviewing... (Type 'q' at any prompt to save and quit)")
+
+    for index, row in actionable_df.iterrows():
+        warning_id = f"{row.get('type')}_{row.get('donor_id', 'unknown')}_{index}"
+
+        if warning_id in resolutions:
+            continue
+
+        clear_screen()
+        print(f"--- Conflict {index + 1} of {len(actionable_df)} ---")
+        print(f"TYPE: {row.get('type')}")
+        print(f"MESSAGE: {row.get('message')}\n")
+
+        decision = None
+
+        # ---------------------------------------------------------
+        # SCENARIO 1: FUZZY NAME MATCH
+        # ---------------------------------------------------------
+        if row.get('type') == 'REVIEW_NEEDED':
+            print("The system found a fuzzy match but wasn't confident enough to auto-merge.")
+            print(f"  New Data:   {row.get('new_email')} | {row.get('new_phone')} | {row.get('new_address')}")
+            print(f"  Existing:   {row.get('existing_email')} | {row.get('existing_phone')} | {row.get('existing_address')}\n")
+
+            print("Options:")
+            print("  (M) MERGE: Same person, combine records.")
+            print("  (S) SEPARATE: Different people, keep them separate.")
+            print("  (W) WORK/HOME: Same person! Merge them, but link the new info to an Organization.")
+            print("  (Q) Quit")
+
+            while decision not in ['m', 's', 'w', 'q']:
+                decision = input("Choose [m/s/w/q]: ").lower().strip()
+
+            if decision == 'q': break
+
+            if decision == 'm':
+                resolutions[warning_id] = {'action': 'merge'}
+            elif decision == 's':
+                resolutions[warning_id] = {'action': 'separate'}
+            elif decision == 'w':
+                org_name = input("  Enter the Organization/Company Name: ").strip()
+                resolutions[warning_id] = {'action': 'merge_and_affiliate', 'org_name': org_name}
+
+        # ---------------------------------------------------------
+        # SCENARIO 2: CONTACT INFO CONFLICTS (Email, Phone, Address)
+        # ---------------------------------------------------------
+        elif row.get('type') in ['EMAIL_CONFLICT', 'PHONE_CONFLICT', 'ADDRESS_CONFLICT']:
+            print("Conflicting contact info found for the SAME person.")
+            print(f"  Person: {row.get('person_name')}")
+            print(f"  Option 1 (Kept by default): {row.get('kept_value')}  [Source: {row.get('kept_source')}]")
+            print(f"  Option 2 (Alternative):     {row.get('alt_value')}  [Source: {row.get('alt_source')}]\n")
+
+            print("Options:")
+            print("  (1) Keep Default (Discard Alternative)")
+            print("  (2) Keep Alternative (Discard Default)")
+
+            if row.get('type') in ['EMAIL_CONFLICT', 'PHONE_CONFLICT']:
+                print("  (3) SPOUSE SPLIT: The alternative value belongs to a spouse/family member.")
+
+            print("  (4) WORK/HOME: Keep one as primary, link the other to an Organization.")
+            print("  (5) KEEP BOTH: Set one as primary, keep the other as an alternate on the SAME person.")
+            print("  (Q) Quit")
+
+            valid_choices = ['1', '2', '4', '5', 'q']
+            if row.get('type') != 'ADDRESS_CONFLICT':
+                valid_choices.append('3')
+
+            while decision not in valid_choices:
+                decision = input(f"Choose [{'|'.join(valid_choices)}]: ").lower().strip()
+
+            if decision == 'q': break
+
+            if decision == '1':
+                resolutions[warning_id] = {'action': 'keep_default', 'value': row.get('kept_value')}
+            elif decision == '2':
+                resolutions[warning_id] = {'action': 'keep_alternative', 'value': row.get('alt_value')}
+            elif decision == '3':
+                fn = input("  Enter spouse First Name: ").strip()
+                ln = input("  Enter spouse Last Name: ").strip()
+                resolutions[warning_id] = {
+                    'action': 'split_to_new_person',
+                    'conflict_type': row.get('type'),
+                    'first_name': fn,
+                    'last_name': ln,
+                    'split_value': row.get('alt_value')
+                }
+            elif decision == '4':
+                org_name = input("  Enter Company Name: ").strip()
+                home_choice = input("  Which option is HOME info? [1/2]: ").strip()
+                resolutions[warning_id] = {
+                    'action': 'keep_personal_and_affiliate',
+                    'org_name': org_name,
+                    'personal_value': row.get('kept_value') if home_choice == '1' else row.get('alt_value'),
+                    'work_value': row.get('alt_value') if home_choice == '1' else row.get('kept_value'),
+                    'conflict_type': row.get('type')
+                }
+            elif decision == '5':
+                primary_choice = input("  Which option is PRIMARY? [1/2]: ").strip()
+                resolutions[warning_id] = {
+                    'action': 'keep_both',
+                    'conflict_type': row.get('type'),
+                    'primary_value': row.get('kept_value') if primary_choice == '1' else row.get('alt_value'),
+                    'alternate_value': row.get('alt_value') if primary_choice == '1' else row.get('kept_value')
+                }
+
+    # Save decisions
+    with open(RESOLUTIONS_FILE, 'w') as f:
+        json.dump(resolutions, f, indent=4)
+    print(f"\n💾 Saved {len(resolutions)} decisions to {RESOLUTIONS_FILE}")
+
+if __name__ == "__main__":
+    main()

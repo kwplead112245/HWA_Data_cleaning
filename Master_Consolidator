@@ -1,0 +1,1326 @@
+"""
+Haywood Waterways Master Data Consolidation Script
+====================================================
+Cross-references 6+ source CSVs to produce import-ready CSVs
+for the haywood_waterways PostgreSQL database.
+"""
+
+import pandas as pd
+import numpy as np
+import re
+import os
+import hashlib
+import logging
+import json
+from datetime import datetime
+from typing import Optional, Dict, List, Tuple
+from collections import defaultdict
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+SOURCE_PRIORITY = {
+    'qgiv': 1,
+    'quickbooks': 1,
+    'old_names': 2,
+    'volunteer_db': 3,
+    'sf_contacts': 4,
+    'sf_accounts': 5,
+    'sf_households': 6,
+}
+
+SCORING_WEIGHTS = {
+    'address_match': 40,
+    'email_match': 50,
+    'phone_match': 50,
+    'name_exact': 20,
+    'name_similar': 15,
+}
+
+MERGE_THRESHOLDS = {
+    'auto_merge': 50,
+    'review': 15,
+}
+
+def load_yaml_config(yaml_path: str = None) -> dict:
+    search_paths = []
+    if yaml_path:
+        search_paths.append(yaml_path)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    search_paths.append(os.path.join(script_dir, 'config.yaml'))
+    search_paths.append(os.path.join(os.getcwd(), 'config.yaml'))
+
+    for path in search_paths:
+        if os.path.exists(path):
+            try:
+                import yaml
+                with open(path, 'r') as f:
+                    cfg = yaml.safe_load(f)
+                logger.info(f"✓ Loaded config from {path}")
+                return cfg
+            except ImportError:
+                return {}
+            except Exception as e:
+                return {}
+    return {}
+
+class Config:
+    def __init__(self, yaml_path: str = None):
+        cfg = load_yaml_config(yaml_path)
+        dirs = cfg.get('directories', {})
+        self.INPUT_DIR = dirs.get('input', 'input_data')
+        self.OUTPUT_DIR = dirs.get('output', 'consolidated_output')
+        self.RESOLUTIONS_FILE = os.path.join(self.OUTPUT_DIR, 'manual_resolutions.json')
+
+        thresholds = cfg.get('thresholds', {})
+        self.AUTO_MERGE_THRESHOLD = thresholds.get('auto_merge', MERGE_THRESHOLDS['auto_merge'])
+        self.REVIEW_THRESHOLD = thresholds.get('review', MERGE_THRESHOLDS['review'])
+
+        scoring = cfg.get('scoring', {})
+        self.SCORING = {
+            'address_match': scoring.get('address_match', SCORING_WEIGHTS['address_match']),
+            'email_match': scoring.get('email_match', SCORING_WEIGHTS['email_match']),
+            'phone_match': scoring.get('phone_match', SCORING_WEIGHTS['phone_match']),
+            'name_exact': scoring.get('name_exact', SCORING_WEIGHTS['name_exact']),
+            'name_similar': scoring.get('name_similar', SCORING_WEIGHTS['name_similar']),
+        }
+
+        sources = cfg.get('sources', {})
+        if sources:
+            global SOURCE_PRIORITY
+            SOURCE_PRIORITY = sources
+
+# ============================================================================
+# FILE CLASSIFIER
+# ============================================================================
+
+FILENAME_PATTERNS = {
+    'qgiv': ['transaction', 'qgiv'],
+    'quickbooks': ['qb_', 'quickbooks'],
+    'old_names': ['names'],
+    'volunteer_db': ['volunteer'],
+    'sf_contacts': ['contact export', 'contact_export', 'sf_contacts', 'contacts'],
+    'sf_accounts': ['sf_accounts', 'account'],
+    'sf_households': ['household', 'cleaned_household'],
+}
+
+COLUMN_FINGERPRINTS = {
+    'qgiv': {'required': ['Transaction ID', 'Total Amount'], 'strong': ['Line Item', 'Batch Date', 'Form Name', 'Recurring ID']},
+    'quickbooks': {'required': ['name', 'amount'], 'strong': ['type', 'date'], 'max_columns': 6},
+    'old_names': {'required': ['FName', 'LName'], 'strong': ['SpousesName', 'HH Number', 'YrJoined', 'Dues']},
+    'volunteer_db': {'required': ['First Name', 'Last Name'], 'strong': ['LAST_CHANGED'], 'max_columns': 10},
+    'sf_contacts': {'required': ['Contact ID'], 'strong': ['Account ID', 'Volunteer Status', 'Membership Join Date']},
+    'sf_accounts': {'required': ['Id'], 'strong': ['npe01__SYSTEM_AccountType__c', 'AccountNumber']},
+    'sf_households': {'required': ['chousehold_name'], 'strong': ['is_member', 'membership_level']},
+}
+
+def classify_file(filepath: str, df: pd.DataFrame) -> Optional[str]:
+    filename = os.path.basename(filepath).lower()
+    columns = set(df.columns.tolist())
+
+    filename_matches = [src for src, kws in FILENAME_PATTERNS.items() if any(kw in filename for kw in kws)]
+    if len(filename_matches) == 1: return filename_matches[0]
+
+    scores = {}
+    for src, fp in COLUMN_FINGERPRINTS.items():
+        if not set(fp.get('required', [])).issubset(columns): continue
+        strong = set(fp.get('strong', []))
+        score = len(strong.intersection(columns)) / (len(strong) or 1)
+        if fp.get('max_columns') and len(columns) > fp.get('max_columns'): score *= 0.3
+        scores[src] = score
+
+    if scores and max(scores.values()) > 0:
+        return max(scores, key=scores.get)
+    if filename_matches:
+        return filename_matches[0]
+    return None
+
+def scan_input_folder(input_dir: str) -> Dict[str, List[Tuple[str, pd.DataFrame]]]:
+    if not os.path.isdir(input_dir): return {}
+    classified = defaultdict(list)
+    files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.csv', '.xlsx', '.xls')) and not f.startswith('~')]
+
+    for filename in sorted(files):
+        filepath = os.path.join(input_dir, filename)
+        df = DataLoader.load_file(filepath)
+        if df is None or df.empty: continue
+        source_type = classify_file(filepath, df)
+        if source_type:
+            classified[source_type].append((filepath, df))
+
+    return classified
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def is_organization_name(name, extra_indicators=None, email=None) -> bool:
+    if pd.isna(name) or not name: return False
+    name_lower = str(name).lower()
+
+    org_indicators = {
+        'inc', 'llc', 'corp', 'corporation', 'company', 'co', 'ltd', 'limited',
+        'foundation', 'fund', 'trust', 'association', 'assoc', 'charity', 'associates',
+        'church', 'ministry', 'parish', 'chapel', 'school', 'university', 'college',
+        'academy', 'institute', 'hospital', 'clinic', 'medical', 'health',
+        'bank', 'credit union', 'financial', 'insurance', 'wealth', 'group', 'partners',
+        'partnership', 'services', 'solutions', 'consulting', 'advisors', 'law',
+        'council', 'commission', 'committee', 'board', 'society', 'club',
+        'lodge', 'chapter', 'county', 'city', 'town', 'village', 'district',
+        'department', 'dept', 'authority', 'agency', 'bureau', 'office',
+        'store', 'shop', 'market', 'restaurant', 'cafe', 'bar', 'grill',
+        'realty', 'realtor', 'properties', 'real estate', 'construction', 'builders', 'roofing', 'plumbing',
+        'farm', 'farms', 'ranch', 'nursery', 'garden', 'landscaping',
+        'auto', 'motors', 'automotive', 'tire', 'towing',
+        'electric', 'power', 'energy', 'gas', 'water', 'utility',
+        'media', 'press', 'publishing', 'news', 'radio', 'tv', 'broadcasting',
+        'tech', 'technology', 'software', 'network', 'hardware',
+        'nonprofit', 'ngo', 'outfitters', 'brewery', 'brewing', 'distillery', 'pllc'
+    }
+    if extra_indicators:
+        org_indicators.update({str(w).lower() for w in extra_indicators})
+
+    clean_words = set(re.findall(r'\b[a-z]+\b', name_lower))
+    if clean_words.intersection(org_indicators):
+        return True
+
+    if email and pd.notna(email) and '@' in str(email):
+        free_domains = {'gmail.com', 'yahoo.com', 'hotmail.com', 'aol.com', 'outlook.com', 'icloud.com', 'mac.com', 'msn.com', 'live.com'}
+        domain_full = str(email).split('@')[-1].lower().strip()
+        if domain_full not in free_domains:
+            domain_main = domain_full.split('.')[0]
+            name_compressed = re.sub(r'[^a-z]', '', name_lower)
+            if len(domain_main) >= 4 and (domain_main in name_compressed or name_compressed in domain_main):
+                return True
+    return False
+
+def clean_string(val):
+    if pd.isna(val): return None
+    val = str(val).strip()
+    return None if val.lower() in ('', 'nan', 'none', 'n/a', 'na', 'null') else val
+
+def clean_name(val):
+    val = clean_string(val)
+    return re.sub(r'\s+', ' ', val).title() if val else None
+
+def clean_email(val):
+    val = clean_string(val)
+    return val.lower().strip() if val and '@' in val and '.' in val.split('@')[-1] else None
+
+def clean_phone(val):
+    if pd.isna(val): return None
+    digits = re.sub(r'\D', '', str(val))
+    if len(digits) == 11 and digits[0] == '1': digits = digits[1:]
+    if len(digits) == 10: return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    elif len(digits) == 7: return f"{digits[:3]}-{digits[3:]}"
+    return digits if len(digits) > 0 else None
+
+def clean_zip(val):
+    if pd.isna(val): return None
+    val = re.sub(r'\.0$', '', str(val).strip())
+    match = re.match(r'(\d{5})(-\d{4})?', val)
+    if match: return match.group(0)
+    digits = re.sub(r'\D', '', val)
+    return digits[:5] if len(digits) >= 5 else clean_string(val)
+
+def normalize_for_matching(val):
+    return re.sub(r'[^a-z0-9]', '', str(val).lower().strip()) if pd.notna(val) and val else ''
+
+def normalize_name_for_matching(name):
+    if pd.isna(name) or name is None: return ''
+    name = re.sub(r'\b(jr|sr|ii|iii|iv|v|esq|md|phd|dds)\b\.?', '', str(name).lower().strip())
+    name = re.sub(r'^(mr|mrs|ms|miss|dr|rev|fr|sr|hon)\.?\s+', '', name)
+    nickname_map = {'bob':'robert','jim':'james','mike':'michael','tom':'thomas','dick':'richard','joe':'joseph','dave':'david','dan':'daniel','pat':'patrick','steve':'steven','ed':'edward','al':'albert','charlie':'charles','jack':'john','sam':'samuel','ben':'benjamin','jerry':'gerald','larry':'lawrence','liz':'elizabeth','kathy':'katherine','sue':'susan','jenny':'jennifer','debbie':'deborah','nancy':'ann','peggy':'margaret','barb':'barbara','chris':'christopher','alex':'alexander','matt':'matthew','andy':'andrew','don':'donald','ron':'ronald','fred':'frederick','ken':'kenneth'}
+    words = re.sub(r'[^a-z\s]', '', name).strip().split()
+    if words: words[0] = nickname_map.get(words[0], words[0])
+    return re.sub(r'[^a-z0-9]', '', ''.join(words))
+
+def make_person_key(first_name, last_name, email=None):
+    email_clean = clean_email(email)
+    if email_clean: return f"email:{email_clean}"
+    fn, ln = normalize_name_for_matching(first_name), normalize_name_for_matching(last_name)
+    if fn and ln: return f"name:{fn}:{ln}"
+    return f"unknown:{hashlib.md5(f'{first_name}{last_name}{email}'.encode()).hexdigest()[:12]}"
+
+def make_address_key(address, city, zip_code):
+    addr, cty, zp = normalize_for_matching(address), normalize_for_matching(city), normalize_for_matching(zip_code)
+    return f"{addr}|{cty}|{zp}" if addr and (cty or zp) else None
+
+# ============================================================================
+# DATA LOADERS & PARSERS
+# ============================================================================
+
+class DataLoader:
+    @staticmethod
+    def load_file(filepath: str, file_type: str = 'csv') -> Optional[pd.DataFrame]:
+        if not os.path.exists(filepath): return None
+        if file_type == 'excel' or filepath.lower().endswith(('.xlsx', '.xls')):
+            try: return pd.read_excel(filepath, engine='openpyxl')
+            except Exception: return None
+        else:
+            for enc in ['utf-8', 'latin1', 'cp1252']:
+                try: return pd.read_csv(filepath, encoding=enc, low_memory=False)
+                except Exception: continue
+        return None
+
+    @staticmethod
+    def load_qgiv(filepath: str) -> Optional[pd.DataFrame]:
+        df = DataLoader.load_file(filepath)
+        if df is not None and 'Status' in df.columns:
+            df = df[~df['Status'].str.lower().str.strip().isin(['refunded', 'failed', 'declined', 'cancelled', 'void', 'error'])].copy()
+        return df
+
+    @staticmethod
+    def load_old_names(filepath: str) -> Optional[pd.DataFrame]:
+        return DataLoader.load_file(filepath, 'excel' if filepath.endswith(('.xlsx', '.xls')) else 'csv')
+
+    @staticmethod
+    def load_sf_contacts(filepath: str) -> Optional[pd.DataFrame]:
+        df = DataLoader.load_file(filepath)
+        return df[df['Deleted'] != True].copy() if df is not None and 'Deleted' in df.columns else df
+
+    @staticmethod
+    def load_sf_accounts(filepath: str) -> Optional[pd.DataFrame]:
+        df = DataLoader.load_file(filepath)
+        return df[df['IsDeleted'] != True].copy() if df is not None and 'IsDeleted' in df.columns else df
+
+def parse_concatenated_names(fname, lname, spousesname=None):
+    if pd.isna(fname) and pd.isna(lname): return []
+    fname, lname = str(fname).strip() if pd.notna(fname) else '', str(lname).strip() if pd.notna(lname) else ''
+    people = []
+
+    if re.search(r'\s+(&|and|And)\s+', fname):
+        parts = re.split(r'\s+(&|and|And)\s+', fname)
+        p1, p2 = parts[0].strip().split(), (parts[2].strip().split() if len(parts)>2 else [])
+        people.append({'first_name': p1[0], 'last_name': ' '.join(p1[1:]) if len(p1)>1 else lname})
+        if p2: people.append({'first_name': p2[0], 'last_name': ' '.join(p2[1:]) if len(p2)>1 else lname})
+    elif re.search(r'(&|and|And)\s*$', fname):
+        people.append({'first_name': re.sub(r'\s*(&|and|And)\s*$', '', fname).strip(), 'last_name': lname})
+    elif re.search(r'\s+(&|and|And)\s+', lname):
+        parts = re.split(r'\s+(&|and|And)\s+', lname)
+        p1_lname, p2 = parts[0].strip(), (parts[2].strip().split() if len(parts)>2 else [])
+        people.append({'first_name': fname, 'last_name': p1_lname})
+        if p2: people.append({'first_name': p2[0], 'last_name': ' '.join(p2[1:]) if len(p2)>1 else p1_lname})
+    else:
+        if fname and lname: people.append({'first_name': fname, 'last_name': lname})
+        elif fname:
+            fp = fname.split()
+            people.append({'first_name': fp[0], 'last_name': ' '.join(fp[1:]) if len(fp)>1 else ''})
+
+    if pd.notna(spousesname) and str(spousesname).strip() and len(people) < 2:
+        sp = str(spousesname).strip().split()
+        people.append({'first_name': sp[0], 'last_name': ' '.join(sp[1:]) if len(sp)>1 else (people[0]['last_name'] if people else '')})
+    return people
+
+# ============================================================================
+# MASTER CONSOLIDATOR
+# ============================================================================
+
+class MasterConsolidator:
+    def __init__(self, config: Config):
+        self.config = config
+        self.SCORING = config.SCORING
+        self.warnings = []
+
+        # Load Manual Resolutions
+        self.resolutions = {}
+        if os.path.exists(config.RESOLUTIONS_FILE):
+            with open(config.RESOLUTIONS_FILE, 'r') as f:
+                self.resolutions = json.load(f)
+            logger.info(f"✓ Loaded {len(self.resolutions)} manual resolutions from JSON.")
+
+        self.people = {}
+        self.email_index = {}
+        self.name_index = {}
+        self._lastname_index = {}
+        self._address_index = {}
+        self._phone_index = {}
+
+        self.households = {}
+        self.organizations = {}
+        self.donations = []
+        self.volunteer_records = {}
+        self.donor_org_affiliations = []
+
+        self._donor_id = 0
+        self._household_id = 0
+        self._org_id = 0
+        self._volunteer_id = 0
+        self._donation_id = 0
+
+    def _next_donor_id(self) -> int:
+        self._donor_id += 1
+        return self._donor_id
+    def _next_household_id(self) -> int:
+        self._household_id += 1
+        return self._household_id
+    def _next_org_id(self) -> int:
+        self._org_id += 1
+        return self._org_id
+    def _next_volunteer_id(self) -> int:
+        self._volunteer_id += 1
+        return self._volunteer_id
+    def _next_donation_id(self) -> int:
+        self._donation_id += 1
+        return self._donation_id
+
+    def find_person(self, first_name, last_name, email=None, phone=None, zip_code=None, address_line1=None, city=None):
+        scores = self.SCORING
+        auto_threshold = self.config.AUTO_MERGE_THRESHOLD
+        review_threshold = self.config.REVIEW_THRESHOLD
+
+        email_clean = clean_email(email)
+        addr_norm = self._normalize_address(address_line1, city)
+        ph_digits = self._normalize_phone_digits(phone)
+        fn, ln = normalize_name_for_matching(first_name), normalize_name_for_matching(last_name)
+        has_contact_info = bool(addr_norm or email_clean or ph_digits)
+
+        candidates = set()
+        if addr_norm and addr_norm in self._address_index: candidates.update(self._address_index[addr_norm])
+        if email_clean and email_clean in self.email_index: candidates.add(self.email_index[email_clean])
+        if ph_digits and ph_digits in self._phone_index: candidates.update(self._phone_index[ph_digits])
+        if fn and ln and f"{fn}:{ln}" in self.name_index: candidates.update(self.name_index[f"{fn}:{ln}"])
+
+        if not candidates: return None, 0
+
+        best_key, best_score, best_breakdown = None, 0, {}
+
+        for pk in candidates:
+            person = self.people[pk]
+            score = 0
+            breakdown = {}
+
+            if addr_norm and addr_norm == self._normalize_address(person.get('address_line1'), person.get('city')):
+                score += scores['address_match']
+                breakdown['address'] = scores['address_match']
+
+            if email_clean and (email_clean == person.get('email') or email_clean in person.get('_all_emails', set())):
+                score += scores['email_match']
+                breakdown['email'] = scores['email_match']
+
+            if ph_digits and ph_digits == self._normalize_phone_digits(person.get('phone')):
+                score += scores['phone_match']
+                breakdown['phone'] = scores['phone_match']
+
+            if fn and ln:
+                existing_fn = normalize_name_for_matching(person.get('first_name', ''))
+                existing_ln = normalize_name_for_matching(person.get('last_name', ''))
+
+                if fn == existing_fn and ln == existing_ln:
+                    score += scores['name_exact']
+                    breakdown['name_exact'] = scores['name_exact']
+
+                    existing_has_contact = bool(person.get('email') or person.get('phone') or person.get('address_line1'))
+                    if not has_contact_info and not existing_has_contact:
+                        score = max(score, auto_threshold)
+                        breakdown['override'] = 'exact_name_neither_has_contact'
+                    elif not has_contact_info or not existing_has_contact:
+                        score = max(score, auto_threshold)
+                        breakdown['override'] = 'exact_name_one_blank_no_conflict'
+
+                elif ln == existing_ln and fn and existing_fn and fn[0] == existing_fn[0]:
+                    score += scores['name_similar']
+                    breakdown['name_similar'] = scores['name_similar']
+
+                elif ln == existing_ln and fn != existing_fn:
+                    score = 0
+                    breakdown['override'] = 'family_member_shared_info'
+
+            if score > best_score:
+                best_score = score
+                best_key = pk
+                best_breakdown = breakdown
+
+        if best_score >= auto_threshold:
+            return best_key, best_score
+        elif best_score >= review_threshold:
+            person = self.people[best_key]
+            warning_id = f"REVIEW_NEEDED_{person.get('donor_id')}_{len(self.warnings)}"
+
+            # --- RESOLUTION ENGINE INTERCEPT ---
+            if warning_id in self.resolutions:
+                action = self.resolutions[warning_id].get('action')
+                if action == 'merge': return best_key, 100
+                elif action == 'separate': return None, 0
+                elif action == 'merge_and_affiliate':
+                    org_name = self.resolutions[warning_id].get('org_name')
+                    person['_pending_affiliations'] = person.get('_pending_affiliations', [])
+                    person['_pending_affiliations'].append(org_name)
+                    return best_key, 100
+
+            self.warnings.append({
+                'type': 'REVIEW_NEEDED',
+                'confidence_score': best_score,
+                'score_breakdown': str(best_breakdown),
+                'message': f"Score {best_score}: '{first_name} {last_name}' might be '{person.get('first_name')} {person.get('last_name')}'",
+                'new_email': email_clean,
+                'new_phone': clean_phone(phone),
+                'new_address': clean_string(address_line1),
+                'existing_donor_id': person.get('donor_id'),
+                'existing_email': person.get('email'),
+                'existing_phone': person.get('phone'),
+                'existing_address': person.get('address_line1'),
+            })
+            return None, best_score
+        else:
+            return None, best_score
+
+    @staticmethod
+    def _normalize_address(address_line1, city):
+        addr, cty = clean_string(address_line1), clean_string(city)
+        if not addr or not cty: return None
+        addr, cty = addr.lower().strip(), cty.lower().strip()
+        replacements = {r'\bstreet\b': 'st', r'\bst\.\b': 'st', r'\bavenue\b': 'ave', r'\bave\.\b': 'ave', r'\bdrive\b': 'dr', r'\bdr\.\b': 'dr', r'\broad\b': 'rd', r'\brd\.\b': 'rd', r'\blane\b': 'ln', r'\bln\.\b': 'ln', r'\bcourt\b': 'ct', r'\bct\.\b': 'ct', r'\bcircle\b': 'cir', r'\bcir\.\b': 'cir', r'\bboulevard\b': 'blvd', r'\bblvd\.\b': 'blvd', r'\bplace\b': 'pl', r'\bpl\.\b': 'pl', r'\bnorth\b': 'n', r'\bsouth\b': 's', r'\beast\b': 'e', r'\bwest\b': 'w', r'\bapartment\b': 'apt', r'\bapt\.\b': 'apt', r'\bapt\b': 'apt', r'\bsuite\b': 'ste', r'\bste\.\b': 'ste', r'\bunit\b': 'unit', r'\bpo box\b': 'po box', r'\bp\.o\. box\b': 'po box', r'\bp\.o\.box\b': 'po box', r'\bpob\b': 'po box'}
+        for pat, rep in replacements.items(): addr = re.sub(pat, rep, addr)
+        addr = re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', addr)).strip()
+        cty = re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', cty)).strip()
+        return f"{addr}|{cty}"
+
+    @staticmethod
+    def _normalize_phone_digits(phone):
+        if pd.isna(phone) or phone is None: return None
+        digits = re.sub(r'\D', '', str(phone))
+        return digits[-7:] if len(digits) >= 7 else None
+
+    def register_person(self, first_name, last_name, email=None, source='unknown', **kwargs) -> str:
+        first_name, last_name = clean_name(first_name) or 'Unknown', clean_name(last_name) or 'Unknown'
+        email_clean = clean_email(email)
+
+        existing_key, match_score = self.find_person(
+            first_name, last_name, email,
+            kwargs.get('phone'), kwargs.get('zip_code'),
+            address_line1=kwargs.get('address_line1'), city=kwargs.get('city'),
+        )
+
+        if existing_key:
+            self._merge_person(existing_key, first_name, last_name, email_clean, source, **kwargs)
+            return existing_key
+
+        person_key = make_person_key(first_name, last_name, email)
+        if person_key in self.people: person_key = f"{person_key}:{hashlib.md5(str(datetime.now()).encode()).hexdigest()[:8]}"
+
+        self.people[person_key] = {
+            'person_key': person_key,
+            'donor_id': self._next_donor_id(),
+            'first_name': first_name,
+            'last_name': last_name,
+            'email': email_clean,
+            'phone': clean_phone(kwargs.get('phone')),
+            'address_line1': clean_string(kwargs.get('address_line1')),
+            'address_line2': clean_string(kwargs.get('address_line2')),
+            'city': clean_string(kwargs.get('city')),
+            'state': clean_string(kwargs.get('state')),
+            'zip_code': clean_zip(kwargs.get('zip_code')),
+            'country': clean_string(kwargs.get('country')) or 'US',
+            'donor_type': clean_string(kwargs.get('donor_type')) or 'Individual',
+            'donor_status': clean_string(kwargs.get('donor_status')) or 'Active',
+            'preferred_contact_method': clean_string(kwargs.get('preferred_contact_method')),
+            'is_member': kwargs.get('is_member', False),
+            'membership_level': clean_string(kwargs.get('membership_level')),
+            'membership_start_date': kwargs.get('membership_start_date'),
+            'membership_expiration_date': kwargs.get('membership_expiration_date'),
+            'membership_status': clean_string(kwargs.get('membership_status')),
+            'date_added': kwargs.get('date_added'),
+            'last_contact_date': kwargs.get('last_contact_date'),
+            'total_lifetime_donations': kwargs.get('total_lifetime_donations', 0),
+            'notes': clean_string(kwargs.get('notes')),
+            'gender': clean_string(kwargs.get('gender')),
+            'is_primary_contact': kwargs.get('is_primary_contact', True),
+            'household_id': kwargs.get('household_id'),
+            '_source': source,
+            '_source_priority': SOURCE_PRIORITY.get(source, 99),
+            '_all_emails': set([email_clean]) if email_clean else set(),
+        }
+
+        if email_clean: self.email_index[email_clean] = person_key
+        fn, ln = normalize_name_for_matching(first_name), normalize_name_for_matching(last_name)
+        if fn and ln: self.name_index.setdefault(f"{fn}:{ln}", []).append(person_key)
+
+        addr_norm = self._normalize_address(kwargs.get('address_line1'), kwargs.get('city'))
+        if addr_norm: self._address_index.setdefault(addr_norm, []).append(person_key)
+
+        ph_digits = self._normalize_phone_digits(kwargs.get('phone'))
+        if ph_digits: self._phone_index.setdefault(ph_digits, []).append(person_key)
+
+        return person_key
+
+    def _merge_person(self, person_key: str, first_name, last_name, email, source, **kwargs):
+        """Merge new data into existing person record, now with JSON resolution support."""
+        person = self.people[person_key]
+        new_priority = SOURCE_PRIORITY.get(source, 99)
+        existing_priority = person.get('_source_priority', 99)
+        p_display = f"{person.get('first_name')} {person.get('last_name')} (donor_id={person.get('donor_id')})"
+
+        # --- Email Conflict & Resolution Engine ---
+        if email:
+            person['_all_emails'].add(email)
+            if email not in self.email_index: self.email_index[email] = person_key
+            existing_email = person.get('email')
+
+            if existing_email and email != existing_email:
+                # Reconstruct the ID generated by manual_reviewer.py
+                w_id = f"EMAIL_CONFLICT_{person.get('donor_id')}_{len(self.warnings)}"
+                res = self.resolutions.get(w_id)
+
+                if res:
+                    action = res.get('action')
+                    if action == 'keep_default':
+                        email = existing_email
+                    elif action == 'keep_alternative':
+                        pass  # keep the new 'email' variable as is
+                    elif action == 'keep_both':
+                        email = res.get('primary_value')
+                        person['notes'] = f"{person.get('notes', '')} | Alt Email: {res.get('alternate_value')}".strip(
+                            ' |')
+                    elif action == 'keep_personal_and_affiliate':
+                        email = res.get('personal_value')
+                        # Queue the affiliation to be handled at the end
+                        person['_pending_affiliations'] = person.get('_pending_affiliations', [])
+                        person['_pending_affiliations'].append(res.get('org_name'))
+                    elif action == 'split_to_new_person':
+                        # Queue the spouse to be created at the end
+                        person['_pending_spouses'] = person.get('_pending_spouses', [])
+                        person['_pending_spouses'].append({
+                            'first_name': res.get('first_name'),
+                            'last_name': res.get('last_name'),
+                            'email': email
+                        })
+                        email = existing_email  # Keep Jane's email on Jane's record
+                else:
+                    self.warnings.append({
+                        'type': 'EMAIL_CONFLICT', 'donor_id': person.get('donor_id'),
+                        'kept_value': existing_email if new_priority >= existing_priority else email,
+                        'alt_value': email if new_priority >= existing_priority else existing_email,
+                        # ... other metadata ...
+                    })
+
+                # --- Phone Conflict & Resolution Engine ---
+                new_phone = clean_phone(kwargs.get('phone'))
+                existing_phone = person.get('phone')
+                if new_phone and existing_phone and new_phone != existing_phone:
+                    w_id = f"PHONE_CONFLICT_{person.get('donor_id')}_{len(self.warnings)}"
+                    res = self.resolutions.get(w_id)
+                    if res:
+                        action = res.get('action')
+                        if action == 'keep_default':
+                            new_phone = existing_phone
+                        elif action == 'keep_alternative':
+                            pass  # Keep the new_phone as is
+                        elif action == 'keep_both':
+                            new_phone = res.get('primary_value')
+                            person[
+                                'notes'] = f"{person.get('notes', '')} | Alt Phone: {res.get('alternate_value')}".strip(
+                                ' |')
+                        elif action == 'keep_personal_and_affiliate':
+                            new_phone = res.get('personal_value')
+                            person['_pending_affiliations'] = person.get('_pending_affiliations', [])
+                            person['_pending_affiliations'].append(res.get('org_name'))
+                        elif action == 'split_to_new_person':
+                            person['_pending_spouses'] = person.get('_pending_spouses', [])
+                            person['_pending_spouses'].append({
+                                'first_name': res.get('first_name'),
+                                'last_name': res.get('last_name'),
+                                'phone': new_phone
+                            })
+                            new_phone = existing_phone
+                    else:
+                        # The full dictionary that prevents the error:
+                        self.warnings.append({
+                            'type': 'PHONE_CONFLICT',
+                            'message': f"Different phones for {p_display}",
+                            'donor_id': person.get('donor_id'),
+                            'person_name': p_display,
+                            'kept_value': existing_phone if new_priority >= existing_priority else new_phone,
+                            'kept_source': person.get('_source') if new_priority >= existing_priority else source,
+                            'alt_value': new_phone if new_priority >= existing_priority else existing_phone,
+                            'alt_source': source if new_priority >= existing_priority else person.get('_source'),
+                        })
+                kwargs['phone'] = new_phone
+
+        # --- Final Merge Fields (Priority Based) ---
+        merge_fields = ['phone', 'address_line1', 'city', 'state', 'zip_code', 'membership_level', 'gender']
+        for field in merge_fields:
+            new_val = kwargs.get(field)
+            if new_val and (person.get(field) is None or new_priority < existing_priority):
+                person[field] = new_val
+
+        if email: person['email'] = email
+        # --- Phone Conflict & Resolution ---
+        new_phone, existing_phone = clean_phone(kwargs.get('phone')), person.get('phone')
+        if new_phone and existing_phone and new_phone != existing_phone:
+            w_id = f"PHONE_CONFLICT_{person.get('donor_id')}_{len(self.warnings)}"
+            res = self.resolutions.get(w_id)
+            if res:
+                action = res.get('action')
+                if action == 'keep_default': new_phone = existing_phone
+                elif action == 'keep_both':
+                    new_phone = res.get('primary_value')
+                    person['notes'] = f"{person.get('notes', '')} | Alt Phone: {res.get('alternate_value')}".strip(' |')
+                elif action == 'keep_personal_and_affiliate':
+                    new_phone = res.get('personal_value')
+                    person['_pending_affiliations'] = person.get('_pending_affiliations', [])
+                    person['_pending_affiliations'].append(res.get('org_name'))
+                elif action == 'split_to_new_person':
+                    person['_pending_spouses'] = person.get('_pending_spouses', [])
+                    person['_pending_spouses'].append({'first_name': res.get('first_name'), 'last_name': res.get('last_name'), 'phone': new_phone})
+                    new_phone = existing_phone
+            else:
+                self.warnings.append({
+                    'type': 'PHONE_CONFLICT', 'message': f"Different phones for {p_display}", 'donor_id': person.get('donor_id'),
+                    'person_name': p_display, 'kept_value': existing_phone if new_priority >= existing_priority else new_phone,
+                    'kept_source': person.get('_source') if new_priority >= existing_priority else source,
+                    'alt_value': new_phone if new_priority >= existing_priority else existing_phone,
+                    'alt_source': source if new_priority >= existing_priority else person.get('_source'),
+                })
+        kwargs['phone'] = new_phone
+
+        # --- Address Conflict & Resolution ---
+        new_address, existing_address = clean_string(kwargs.get('address_line1')), person.get('address_line1')
+        if new_address and existing_address:
+            n_norm, e_norm = self._normalize_address(new_address, kwargs.get('city')), self._normalize_address(existing_address, person.get('city'))
+            if n_norm and e_norm and n_norm != e_norm:
+                w_id = f"ADDRESS_CONFLICT_{person.get('donor_id')}_{len(self.warnings)}"
+                res = self.resolutions.get(w_id)
+                if res:
+                    action = res.get('action')
+                    if action == 'keep_default':
+                        kwargs['address_line1'], kwargs['city'], kwargs['state'], kwargs['zip_code'] = existing_address, person.get('city'), person.get('state'), person.get('zip_code')
+                    elif action == 'keep_personal_and_affiliate':
+                        person['_pending_affiliations'] = person.get('_pending_affiliations', [])
+                        person['_pending_affiliations'].append(res.get('org_name'))
+                        if res.get('personal_value') == existing_address:
+                            kwargs['address_line1'], kwargs['city'], kwargs['state'], kwargs['zip_code'] = existing_address, person.get('city'), person.get('state'), person.get('zip_code')
+                else:
+                    self.warnings.append({
+                        'type': 'ADDRESS_CONFLICT', 'message': f"Different addresses for {p_display}", 'donor_id': person.get('donor_id'),
+                        'person_name': p_display, 'kept_value': f"{existing_address}, {person.get('city') or ''}" if new_priority >= existing_priority else f"{new_address}, {clean_string(kwargs.get('city')) or ''}",
+                        'kept_source': person.get('_source') if new_priority >= existing_priority else source,
+                        'alt_value': f"{new_address}, {clean_string(kwargs.get('city')) or ''}" if new_priority >= existing_priority else f"{existing_address}, {person.get('city') or ''}",
+                        'alt_source': source if new_priority >= existing_priority else person.get('_source'),
+                    })
+
+        # Final merge loop
+        merge_fields = ['phone', 'address_line1', 'address_line2', 'city', 'state', 'zip_code', 'country', 'donor_type', 'donor_status', 'preferred_contact_method', 'membership_level', 'membership_start_date', 'membership_expiration_date', 'membership_status', 'date_added', 'last_contact_date', 'gender']
+        for field in merge_fields:
+            new_val = kwargs.get(field)
+            if field == 'zip_code': new_val = clean_zip(new_val)
+            elif field in ('address_line1', 'address_line2', 'city', 'state', 'country', 'donor_type', 'donor_status', 'preferred_contact_method', 'membership_level', 'membership_status', 'gender'): new_val = clean_string(new_val)
+            if new_val is not None and (person.get(field) is None or new_priority < existing_priority): person[field] = new_val
+
+        if email and (person.get('email') is None or new_priority < existing_priority): person['email'] = email
+        if kwargs.get('is_member'): person['is_member'] = True
+        if kwargs.get('total_lifetime_donations') and kwargs.get('total_lifetime_donations') > (person.get('total_lifetime_donations') or 0): person['total_lifetime_donations'] = kwargs.get('total_lifetime_donations')
+        if clean_string(kwargs.get('notes')): person['notes'] = f"{person.get('notes') or ''} | {clean_string(kwargs.get('notes'))}".strip(' |')
+        if new_priority < existing_priority: person['_source_priority'], person['_source'] = new_priority, source
+
+    def find_or_create_household(self, person_key: str, household_name: str = None, address: str = None, city: str = None, state: str = None, zip_code: str = None, phone: str = None, **kwargs) -> int:
+        addr_key = make_address_key(address, city, zip_code)
+        if addr_key and addr_key in self.households:
+            hh = self.households[addr_key]
+            if phone and not hh.get('phone'): hh['phone'] = clean_phone(phone)
+            return hh['household_id']
+
+        hh_id = self._next_household_id()
+        person = self.people.get(person_key, {})
+        if not household_name: household_name = f"{person.get('first_name', '')} {person.get('last_name', '')} Household".strip()
+
+        self.households[addr_key if addr_key else f"hh_{hh_id}"] = {
+            'household_id': hh_id, 'household_name': household_name, 'primary_contact_id': person.get('donor_id'),
+            'address_line1': clean_string(address), 'address_line2': clean_string(kwargs.get('address_line2')),
+            'city': clean_string(city), 'state': clean_string(state), 'zip_code': clean_zip(zip_code), 'country': clean_string(kwargs.get('country')) or 'US',
+            'phone': clean_phone(phone), 'is_member': kwargs.get('is_member', False), 'membership_level': clean_string(kwargs.get('membership_level')),
+            'membership_start_date': kwargs.get('membership_start_date'), 'membership_expiration_date': kwargs.get('membership_expiration_date'),
+            'membership_status': clean_string(kwargs.get('membership_status')), 'total_lifetime_donations': 0, 'notes': clean_string(kwargs.get('notes')),
+            '_address_key': addr_key, '_member_keys': [person_key],
+        }
+        return hh_id
+
+    def find_or_create_organization(self, org_name: str, **kwargs) -> int:
+        org_name_clean = clean_string(org_name)
+        if not org_name_clean: return None
+        norm_key = normalize_for_matching(org_name_clean)
+        if norm_key in self.organizations: return self.organizations[norm_key]['organization_id']
+
+        org_id = self._next_org_id()
+        self.organizations[norm_key] = {
+            'organization_id': org_id, 'organization_name': org_name_clean, 'organization_type': clean_string(kwargs.get('organization_type')),
+            'tax_id': clean_string(kwargs.get('tax_id')), 'website': clean_string(kwargs.get('website')),
+            'address_line1': clean_string(kwargs.get('address_line1')), 'address_line2': clean_string(kwargs.get('address_line2')),
+            'city': clean_string(kwargs.get('city')), 'state': clean_string(kwargs.get('state')), 'zip_code': clean_zip(kwargs.get('zip_code')),
+            'country': clean_string(kwargs.get('country')) or 'US', 'phone': clean_phone(kwargs.get('phone')),
+            'is_member': kwargs.get('is_member', False), 'membership_level': clean_string(kwargs.get('membership_level')),
+            'membership_start_date': kwargs.get('membership_start_date'), 'membership_expiration_date': kwargs.get('membership_expiration_date'),
+            'membership_status': clean_string(kwargs.get('membership_status')), 'is_vendor': kwargs.get('is_vendor', False),
+            'vendor_category': clean_string(kwargs.get('vendor_category')), 'total_lifetime_donations': 0, 'notes': clean_string(kwargs.get('notes')),
+        }
+        return org_id
+
+    # ------------------------------------------------------------------
+    # SOURCE PROCESSORS
+    # ------------------------------------------------------------------
+
+    def process_qgiv(self, df: pd.DataFrame):
+        logger.info("\n--- Processing Qgiv Transactions ---")
+        donation_count, skipped_amount = 0, 0
+
+        for _, row in df.iterrows():
+            first_name = clean_string(row.get('First Name'))
+            last_name = clean_string(row.get('Last Name'))
+            email = clean_email(row.get('Email'))
+            phone = clean_phone(row.get('Phone'))
+            company = clean_string(row.get('Company'))
+
+            if not first_name and not last_name and not email and not company:
+                continue
+
+            # ==========================================================
+            # ORG INTERCEPT: Did they put the company in the name fields?
+            # ==========================================================
+            combined_name = f"{first_name or ''} {last_name or ''}".strip()
+            if not company and is_organization_name(combined_name, email=email):
+                company = combined_name
+                first_name = None
+                last_name = None
+
+            person_key = None
+            if first_name or last_name or email:
+                person_key = self.register_person(
+                    first_name=first_name, last_name=last_name, email=email, source='qgiv',
+                    phone=phone, address_line1=row.get('Address'), city=row.get('City'),
+                    state=row.get('State'), zip_code=row.get('Zip'), country=row.get('Country'),
+                )
+
+            amount = row.get('Total Amount') or row.get('Line Amount')
+            if pd.notna(amount):
+                try: amount = float(str(amount).replace('$', '').replace(',', ''))
+                except: amount = None
+
+            if amount and amount > 0:
+                donation_date = pd.to_datetime(row.get('Date'), errors='coerce')
+
+                org_id = None
+                if company:
+                    org_id = self.find_or_create_organization(company, organization_type='Donor')
+                    if person_key and org_id:
+                        self.donor_org_affiliations.append({
+                            'donor_id': self.people[person_key]['donor_id'], 'organization_id': org_id,
+                            'affiliation_type': 'Employee', 'is_primary_affiliation': True, 'is_active': True,
+                        })
+
+                self.donations.append({
+                    'donation_id': self._next_donation_id(),
+                    'donor_id': self.people[person_key]['donor_id'] if person_key else None,
+                    'donation_date': donation_date.date() if pd.notna(donation_date) else None,
+                    'amount': amount, 'payment_method': clean_string(row.get('Payment Method')),
+                    'check_number': clean_string(row.get('Check Number')), 'transaction_id': clean_string(row.get('Transaction ID')),
+                    'donation_type': self._map_qgiv_type(row), 'is_membership_donation': self._is_membership_donation(row),
+                    'membership_level': None, 'is_tax_deductible': True, 'acknowledgment_sent': False,
+                    'notes': self._build_qgiv_notes(row), 'organization_id': org_id if not person_key else None,
+                    '_form_name': clean_string(row.get('Form Name')),
+                })
+                donation_count += 1
+            else:
+                skipped_amount += 1
+
+            if person_key and clean_string(row.get('Recurring ID')):
+                self.people[person_key]['_has_recurring'] = True
+                self.people[person_key]['_recurring_freq'] = clean_string(row.get('Recurring Frequency'))
+                self.people[person_key]['_recurring_id'] = clean_string(row.get('Recurring ID'))
+
+            if person_key and clean_string(row.get('Event Name')):
+                self.people[person_key]['_events'] = self.people[person_key].get('_events', [])
+                self.people[person_key]['_events'].append(clean_string(row.get('Event Name')))
+
+        logger.info(f"  ✓ {donation_count} donations recorded")
+
+    def _map_qgiv_type(self, row):
+        qt, ft = clean_string(row.get('Type')), clean_string(row.get('Form Type'))
+        if qt and 'recurr' in qt.lower(): return 'Recurring'
+        if ft and 'event' in ft.lower(): return 'Event'
+        if ft and 'peer' in ft.lower(): return 'Peer-to-Peer'
+        return 'One-Time'
+
+    def _is_membership_donation(self, row):
+        for field in [clean_string(row.get('Line Item')), clean_string(row.get('Form Name')), clean_string(row.get('Restriction'))]:
+            if field and any(kw in field.lower() for kw in ['member', 'membership', 'dues']): return True
+        return False
+
+    def _build_qgiv_notes(self, row):
+        parts = [f"{k}: {clean_string(row.get(v))}" for k, v in [("Form", 'Form Name'), ("Event", 'Event Name'), ("Source", 'Source'), ("Memo", 'Memo')] if clean_string(row.get(v))]
+        return ' | '.join(parts) if parts else None
+
+    def process_quickbooks(self, df: pd.DataFrame):
+        logger.info("\n--- Processing QuickBooks Donations ---")
+        donation_count, membership_count, skipped = 0, 0, 0
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        for _, row in df.iterrows():
+            full_name = clean_string(row.get('name'))
+            amount = row.get('amount')
+            if pd.notna(amount):
+                try: amount = float(str(amount).replace('$', '').replace(',', ''))
+                except: amount = None
+
+            if not full_name or not amount or amount <= 0:
+                skipped += 1
+                continue
+
+            donation_date = pd.to_datetime(row.get('date'), errors='coerce')
+            dt_raw = clean_string(row.get('type')) or ''
+            is_mem = 'membership' in dt_raw.lower()
+
+            # ==========================================================
+            # ORG INTERCEPT: Is QuickBooks handing us a business?
+            # ==========================================================
+            if is_organization_name(full_name, extra_indicators=['rotary', 'kiwanis', 'watershed']):
+                org_id = self.find_or_create_organization(full_name, organization_type='Donor')
+                self.donations.append({
+                    'donation_id': self._next_donation_id(), 'donor_id': None,
+                    'donation_date': donation_date.date() if pd.notna(donation_date) else None,
+                    'amount': amount, 'payment_method': 'Offline', 'check_number': None, 'transaction_id': None,
+                    'donation_type': 'Membership' if is_mem else 'Donation', 'is_membership_donation': is_mem,
+                    'membership_level': None, 'is_tax_deductible': True, 'acknowledgment_sent': False,
+                    'notes': f"QuickBooks import | Type: {dt_raw}", 'organization_id': org_id,
+                    '_form_name': 'Membership Levels' if is_mem else None,
+                })
+                donation_count += 1
+                if is_mem: membership_count += 1
+                continue
+
+            name_parts = full_name.strip().split()
+            first_name = name_parts[0]
+            last_name = ' '.join(name_parts[1:]) if len(name_parts) >= 2 else 'Unknown'
+
+            person_key = self.register_person(first_name=first_name, last_name=last_name, source='quickbooks')
+
+            self.donations.append({
+                'donation_id': self._next_donation_id(), 'donor_id': self.people[person_key]['donor_id'],
+                'donation_date': donation_date.date() if pd.notna(donation_date) else None,
+                'amount': amount, 'payment_method': 'Offline', 'check_number': None, 'transaction_id': None,
+                'donation_type': 'Membership' if is_mem else 'Donation', 'is_membership_donation': is_mem,
+                'membership_level': None, 'is_tax_deductible': True, 'acknowledgment_sent': False,
+                'notes': f"QuickBooks import | Type: {dt_raw}", 'organization_id': None,
+                '_form_name': 'Membership Levels' if is_mem else None,
+            })
+            donation_count += 1
+            if is_mem: membership_count += 1
+
+        logger.info(f"  ✓ {donation_count} QB donations recorded")
+
+    def process_old_names(self, df: pd.DataFrame):
+        logger.info("\n--- Processing Old Names Database ---")
+        for _, row in df.iterrows():
+            people = parse_concatenated_names(row.get('FName'), row.get('LName'), row.get('SpousesName'))
+            if not people: continue
+
+            membership_date = None
+            try:
+                yr, mo, dy = row.get('YrJoined'), row.get('MonJoined', 1), row.get('DayJoined', 1)
+                if pd.notna(yr): membership_date = datetime(int(yr), int(mo if pd.notna(mo) else 1), int(dy if pd.notna(dy) else 1)).date()
+            except: pass
+
+            dues = row.get('Dues')
+            ml = 'Patron' if pd.notna(dues) and float(dues)>=500 else 'Donor' if pd.notna(dues) and float(dues)>=200 else 'Sponsor' if pd.notna(dues) and float(dues)>=100 else 'Supporter' if pd.notna(dues) and float(dues)>=50 else 'Contributor' if pd.notna(dues) and float(dues)>=25 else 'Associate' if pd.notna(dues) else None
+            last_paid = pd.to_datetime(row.get('lastPd'), errors='coerce')
+            ms = 'Expired' if pd.notna(last_paid) and (datetime.now() - last_paid).days > 365 else 'Active'
+
+            person_keys = []
+            for i, person in enumerate(people):
+                person_keys.append(self.register_person(
+                    first_name=person['first_name'], last_name=person['last_name'],
+                    email=row.get('EMail') if i==0 else None, source='old_names',
+                    phone=row.get('Phone') if i==0 else None, address_line1=row.get('Add'),
+                    city=row.get('City'), state=row.get('St'), zip_code=row.get('Zip'),
+                    is_member=pd.notna(dues), membership_level=ml, membership_start_date=membership_date,
+                    membership_status=ms, is_primary_contact=(i==0), notes=f"Old DB Type: {row.get('Type')}. Interests: {row.get('Interests', '')}",
+                ))
+
+            org_name = row.get('Organization')
+            if pd.notna(org_name) and str(org_name).strip():
+                org_id = self.find_or_create_organization(org_name, organization_type='Member', phone=row.get('OfficePhone'), is_member=True)
+                if pd.notna(row.get('ContactPerson')) and person_keys:
+                    self.donor_org_affiliations.append({'donor_id': self.people[person_keys[0]]['donor_id'], 'organization_id': org_id, 'affiliation_type': 'Contact', 'is_primary_affiliation': True, 'is_active': True})
+
+    def process_volunteer_db(self, df: pd.DataFrame):
+        logger.info("\n--- Processing Volunteer Database ---")
+        for _, row in df.iterrows():
+            first_name, last_name, email = row.get('First Name'), row.get('Last Name'), row.get('Email Address')
+            if pd.isna(first_name) and pd.isna(last_name): continue
+            pk = self.register_person(first_name=first_name, last_name=last_name, email=email, source='volunteer_db')
+            lc = pd.to_datetime(row.get('LAST_CHANGED'), errors='coerce')
+            self.volunteer_records[pk] = {
+                'volunteer_id': self._next_volunteer_id(), 'first_name': clean_name(first_name), 'last_name': clean_name(last_name),
+                'email': clean_email(email), 'volunteer_status': 'Active', 'date_joined': lc.date() if pd.notna(lc) else None,
+                'notes': 'Imported from Volunteer DB', '_person_key': pk,
+            }
+
+    def process_sf_contacts(self, df: pd.DataFrame):
+        logger.info("\n--- Processing Salesforce Contacts ---")
+        for _, row in df.iterrows():
+            first_name, last_name, email = row.get('First Name'), row.get('Last Name'), row.get('Email')
+            if pd.isna(first_name) and pd.isna(last_name): continue
+
+            ml, ms_start, ms_end = clean_string(row.get('Last Membership Level')), pd.to_datetime(row.get('Membership Join Date'), errors='coerce'), pd.to_datetime(row.get('Membership End Date'), errors='coerce')
+            is_mem = bool(ml or pd.notna(ms_start))
+            ms_status = 'Expired' if pd.notna(ms_end) and ms_end < pd.Timestamp.now() else 'Active' if is_mem else None
+
+            try: total_gifts = float(row.get('Total Gifts', 0))
+            except: total_gifts = None
+
+            pk = self.register_person(
+                first_name=first_name, last_name=last_name, email=email, source='sf_contacts',
+                phone=row.get('Home Phone') or row.get('Business Phone') or row.get('Mobile Phone'),
+                address_line1=row.get('Mailing Street'), city=row.get('Mailing City'), state=row.get('Mailing State/Province'),
+                zip_code=row.get('Mailing Zip/Postal Code'), country=row.get('Mailing Country'),
+                is_member=is_mem, membership_level=ml, membership_start_date=ms_start.date() if pd.notna(ms_start) else None,
+                membership_expiration_date=ms_end.date() if pd.notna(ms_end) else None, membership_status=ms_status,
+                total_lifetime_donations=total_gifts, date_added=pd.to_datetime(row.get('Created Date'), errors='coerce'),
+                last_contact_date=pd.to_datetime(row.get('Last Activity'), errors='coerce'),
+            )
+
+            # ==========================================================
+            # THE MISSING LINK: Link SF Contacts to SF Orgs
+            # ==========================================================
+            account_name = clean_string(row.get('Account Name'))
+            if account_name and is_organization_name(account_name):
+                org_id = self.find_or_create_organization(account_name, organization_type='Corporate/Business')
+                if org_id:
+                    self.donor_org_affiliations.append({
+                        'donor_id': self.people[pk]['donor_id'], 'organization_id': org_id,
+                        'affiliation_type': clean_string(row.get('Title')) or 'Employee/Contact',
+                        'is_primary_affiliation': True, 'is_active': True,
+                    })
+
+            vol_status = clean_string(row.get('Volunteer Status'))
+            if vol_status and pk not in self.volunteer_records:
+                self.volunteer_records[pk] = {
+                    'volunteer_id': self._next_volunteer_id(), 'first_name': clean_name(first_name), 'last_name': clean_name(last_name),
+                    'email': clean_email(email), 'volunteer_status': vol_status, 'skills': clean_string(row.get('Volunteer Skills')),
+                    'availability': clean_string(row.get('Volunteer Availability')), 'total_hours': float(row.get('Volunteer Hours')) if pd.notna(row.get('Volunteer Hours')) else None,
+                    'notes': clean_string(row.get('Volunteer Notes')), '_person_key': pk,
+                }
+
+    def _is_household_account(self, name: str, row: pd.Series) -> bool:
+        n_lower = name.lower().strip()
+        if 'household' in n_lower: return True
+        at = clean_string(row.get('npe01__SYSTEM_AccountType__c') or row.get('Type'))
+        if at and ('household' in at.lower() or 'individual' in at.lower()): return True
+        if pd.notna(row.get('npe01__One2OneContact__c')) and str(row.get('npe01__One2OneContact__c')).strip(): return True
+        if not is_organization_name(name): return True
+        return False
+
+    def process_sf_accounts(self, df: pd.DataFrame):
+        logger.info("\n--- Processing Salesforce Accounts ---")
+        for _, row in df.iterrows():
+            name = clean_string(row.get('Name'))
+            if not name or self._is_household_account(name, row): continue
+
+            ml = clean_string(row.get('Membership_Level__c') or row.get('npo02__LastMembershipLevel__c'))
+            is_mem = bool(row.get('Member__c')) if pd.notna(row.get('Member__c')) else bool(ml)
+
+            self.find_or_create_organization(
+                name, organization_type=clean_string(row.get('Type')) or 'Other', website=row.get('Website'),
+                address_line1=row.get('BillingStreet'), city=row.get('BillingCity'), state=row.get('BillingState'),
+                zip_code=row.get('BillingPostalCode'), country=row.get('BillingCountry'), phone=row.get('Phone'),
+                is_member=is_mem, membership_level=ml, notes=clean_string(row.get('Description')),
+            )
+
+    def process_sf_households(self, df: pd.DataFrame):
+        logger.info("\n--- Processing Salesforce Households ---")
+        for _, row in df.iterrows():
+            hh_name = clean_string(row.get('chousehold_name'))
+            if not hh_name: continue
+
+            addr, city, state, zip_c, phone = clean_string(row.get('address')), clean_string(row.get('city')), clean_string(row.get('state')), clean_zip(row.get('zip')), clean_phone(row.get('phone'))
+            is_mem = str(row.get('is_member')).lower() in ('true', 'yes', '1') if pd.notna(row.get('is_member')) else False
+            ml = clean_string(row.get('membership_level'))
+
+            addr_key = make_address_key(addr, city, zip_c)
+            if addr_key and addr_key in self.households:
+                if is_mem: self.households[addr_key]['is_member'] = True
+                if ml: self.households[addr_key]['membership_level'] = ml
+            else:
+                hh_id = self._next_household_id()
+                self.households[addr_key or f"sfhh_{hh_id}"] = {
+                    'household_id': hh_id, 'household_name': hh_name, 'primary_contact_id': None,
+                    'address_line1': addr, 'city': city, 'state': state, 'zip_code': zip_c, 'country': 'US',
+                    'phone': phone, 'is_member': is_mem, 'membership_level': ml, 'membership_start_date': None,
+                    'membership_expiration_date': None, 'membership_status': 'Active' if is_mem else None,
+                    'total_lifetime_donations': 0, 'notes': clean_string(row.get('notes')), '_address_key': addr_key, '_member_keys': [],
+                }
+
+    # ------------------------------------------------------------------
+    # POST-PROCESSING
+    # ------------------------------------------------------------------
+
+    def process_pending_resolutions(self):
+        """Creates new spouse records and organization affiliations flagged by manual review."""
+        logger.info("\n--- Executing Manual Resolutions (Spouses & Affiliations) ---")
+        spouses_created, affiliations_created = 0, 0
+
+        for pk, person in list(self.people.items()):
+            for spouse in person.get('_pending_spouses', []):
+                self.register_person(
+                    first_name=spouse['first_name'], last_name=spouse['last_name'], email=spouse.get('email'),
+                    phone=person.get('phone'), address_line1=person.get('address_line1'), city=person.get('city'),
+                    state=person.get('state'), zip_code=person.get('zip_code'), source='manual_split'
+                )
+                spouses_created += 1
+
+            for org_name in person.get('_pending_affiliations', []):
+                org_id = self.find_or_create_organization(org_name, organization_type='Business')
+                self.donor_org_affiliations.append({
+                    'donor_id': person['donor_id'], 'organization_id': org_id,
+                    'affiliation_type': 'Employee/Contact', 'is_primary_affiliation': True, 'is_active': True
+                })
+                affiliations_created += 1
+
+        if spouses_created or affiliations_created:
+            logger.info(f"  ✓ Created {spouses_created} new spouse records from JSON")
+            logger.info(f"  ✓ Linked {affiliations_created} individuals to Organizations from JSON")
+
+    def assign_households(self):
+        logger.info("\n--- Assigning Households ---")
+        addr_to_hh = {self._normalize_address(hh.get('address_line1'), hh.get('city')): hh for hh in self.households.values() if self._normalize_address(hh.get('address_line1'), hh.get('city'))}
+        phone_to_hh = {self._normalize_phone_digits(hh.get('phone')): hh for hh in self.households.values() if self._normalize_phone_digits(hh.get('phone'))}
+
+        email_to_hh = {}
+        for hh in self.households.values():
+            for mk in hh.get('_member_keys', []):
+                for e in self.people.get(mk, {}).get('_all_emails', set()):
+                    if e: email_to_hh[e] = hh
+
+        for pk, person in self.people.items():
+            if person.get('household_id'): continue
+
+            addr_norm = self._normalize_address(person.get('address_line1'), person.get('city'))
+            if addr_norm and addr_norm in addr_to_hh:
+                person['household_id'] = addr_to_hh[addr_norm]['household_id']
+                if pk not in addr_to_hh[addr_norm]['_member_keys']: addr_to_hh[addr_norm]['_member_keys'].append(pk)
+                if not addr_to_hh[addr_norm].get('primary_contact_id'): addr_to_hh[addr_norm]['primary_contact_id'] = person['donor_id']
+                continue
+
+            ph = self._normalize_phone_digits(person.get('phone'))
+            if ph and ph in phone_to_hh and phone_to_hh[ph].get('household_id'):
+                person['household_id'] = phone_to_hh[ph]['household_id']
+                if pk not in phone_to_hh[ph]['_member_keys']: phone_to_hh[ph]['_member_keys'].append(pk)
+                continue
+
+            if person.get('email') and person['email'] in email_to_hh:
+                person['household_id'] = email_to_hh[person['email']]['household_id']
+                if pk not in email_to_hh[person['email']]['_member_keys']: email_to_hh[person['email']]['_member_keys'].append(pk)
+                continue
+
+            hh_id = self.find_or_create_household(
+                pk, household_name=f"{person.get('first_name', '')} {person.get('last_name', '')} Household".strip(),
+                address=person.get('address_line1'), city=person.get('city'), state=person.get('state'),
+                zip_code=person.get('zip_code'), phone=person.get('phone'), is_member=person.get('is_member', False),
+                membership_level=person.get('membership_level'), membership_start_date=person.get('membership_start_date'),
+                membership_expiration_date=person.get('membership_expiration_date'), membership_status=person.get('membership_status')
+            )
+            person['household_id'] = hh_id
+            if addr_norm: addr_to_hh[addr_norm] = self.households.get(make_address_key(person.get('address_line1'), person.get('city'), person.get('zip_code')) or f"hh_{hh_id}", {})
+            if ph: phone_to_hh[ph] = self.households.get(f"hh_{hh_id}", {})
+
+    MEMBERSHIP_TIERS = [(2000, float('inf'), 'Major Donor'), (500, 1999.99, 'Patron'), (200, 499.99, 'Donor'), (100, 199.99, 'Sponsor'), (50, 99.99, 'Supporter'), (25, 49.99, 'Contributor')]
+
+    def calculate_memberships(self):
+        cy = datetime.now().year
+        donor_annual = defaultdict(lambda: defaultdict(lambda: {'total': 0.0, 'explicit': False}))
+
+        for d in self.donations:
+            did, amt, dt = d.get('donor_id'), d.get('amount', 0) or 0, d.get('donation_date')
+            if not did or amt <= 0 or not dt: continue
+            try: yr = dt.year if hasattr(dt, 'year') else datetime.strptime(dt, '%Y-%m-%d').year
+            except: continue
+            donor_annual[did][yr]['total'] += amt
+            if 'membership levels' in (d.get('_form_name', '') or '').lower(): donor_annual[did][yr]['explicit'] = True
+
+        for pk, person in self.people.items():
+            did = person['donor_id']
+            best_amt, best_yr, is_explicit, has_mem = 0, None, False, False
+
+            for yr in range(cy - 1, cy + 1):
+                tot = donor_annual[did][yr]['total']
+                if tot >= 25:
+                    has_mem = True
+                    if tot > best_amt: best_amt, best_yr = tot, yr
+                    if donor_annual[did][yr]['explicit']: is_explicit = True
+
+            if has_mem:
+                person['is_member'], person['membership_status'], person['membership_type'] = True, 'Active', 'Explicit' if is_explicit else 'Non-Explicit'
+                for mn, mx, lvl in self.MEMBERSHIP_TIERS:
+                    if mn <= best_amt <= mx: person['membership_level'] = lvl
+                person['membership_start_date'] = datetime(best_yr, 1, 1).date() if not person.get('membership_start_date') else person['membership_start_date']
+                person['membership_expiration_date'] = datetime(best_yr + 1, 12, 31).date()
+            elif person.get('is_member') and person.get('membership_level'):
+                person['membership_type'] = 'Source System'
+                exp = person.get('membership_expiration_date')
+                if exp and exp < datetime.now().date(): person['membership_status'] = 'Expired'
+            else:
+                person['is_member'], person['membership_level'], person['membership_status'] = False, None, None
+
+        hh_mem = defaultdict(lambda: {'is_member': False, 'best_level': None, 'start': None, 'exp': None, 'status': None, 'type': None})
+        tp = {lvl: i for i, (_, _, lvl) in enumerate(self.MEMBERSHIP_TIERS)}
+        for person in self.people.values():
+            if person.get('household_id') and person.get('is_member') and person.get('membership_level'):
+                hid = person['household_id']
+                if tp.get(person['membership_level'], 999) < tp.get(hh_mem[hid]['best_level'], 999):
+                    hh_mem[hid].update({'is_member': True, 'best_level': person['membership_level'], 'start': person.get('membership_start_date'), 'exp': person.get('membership_expiration_date'), 'status': person.get('membership_status'), 'type': person.get('membership_type')})
+
+        for hh in self.households.values():
+            if hh['household_id'] in hh_mem:
+                m = hh_mem[hh['household_id']]
+                hh.update({'is_member': m['is_member'], 'membership_level': m['best_level'], 'membership_start_date': m['start'], 'membership_expiration_date': m['exp'], 'membership_status': m['status'], 'membership_type': m['type']})
+
+    def dedupe_donations(self):
+        logger.info("\n--- Deduplicating Donations ---")
+        if not self.donations: return
+
+        def pd(d):
+            dt = d.get('donation_date')
+            if hasattr(dt, 'year'): return dt
+            try: return datetime.strptime(str(dt), '%Y-%m-%d').date()
+            except: return None
+
+        qb_by_amt = defaultdict(list)
+        for i, d in enumerate(self.donations):
+            if d.get('transaction_id') or 'qgiv' in (d.get('notes') or '').lower():
+                dt = pd(d)
+                if dt and d.get('amount'): qb_by_amt[round(float(d['amount']), 2)].append({'did': d['donor_id'], 'dt': dt, 'idx': i})
+
+        seen_dupes = set()
+        for i, d in enumerate(self.donations):
+            if 'quickbooks' in (d.get('notes') or '').lower():
+                dt, amt = pd(d), d.get('amount')
+                if dt and amt:
+                    for q in qb_by_amt.get(round(float(amt), 2), []):
+                        if abs((dt - q['dt']).days) <= 7 and d['donor_id'] == q['did']:
+                            seen_dupes.add(i)
+                            break
+
+        exact_seen = set()
+        final_donations = []
+        for i, d in enumerate(self.donations):
+            if i in seen_dupes: continue
+            k = (d.get('donor_id'), str(d.get('donation_date')), str(round(float(d.get('amount', 0)), 2)), d.get('transaction_id'))
+            if k not in exact_seen:
+                exact_seen.add(k)
+                final_donations.append(d)
+
+        logger.info(f"  ✓ Removed {len(self.donations) - len(final_donations)} duplicate donations")
+        self.donations = final_donations
+
+    def process_pending_resolutions(self):
+        """Creates new spouse records and organization affiliations flagged by manual review."""
+        logger.info("\n--- Executing Manual Resolutions (Spouses & Affiliations) ---")
+
+        # We use list(self.people.items()) because we are adding new people while looping
+        for pk, person in list(self.people.items()):
+
+            # Handle Spouse Splits
+            for spouse in person.get('_pending_spouses', []):
+                self.register_person(
+                    first_name=spouse['first_name'],
+                    last_name=spouse['last_name'],
+                    email=spouse.get('email'),
+                    phone=spouse.get('phone'),
+                    address_line1=person.get('address_line1'),
+                    city=person.get('city'),
+                    state=person.get('state'),
+                    zip_code=person.get('zip_code'),
+                    source='manual_spouse_split'
+                )
+
+            # Handle Work Affiliations
+            for org_name in person.get('_pending_affiliations', []):
+                org_id = self.find_or_create_organization(org_name, organization_type='Business')
+                self.donor_org_affiliations.append({
+                    'donor_id': person['donor_id'],
+                    'organization_id': org_id,
+                    'affiliation_type': 'Employee/Contact',
+                    'is_primary_affiliation': True,
+                    'is_active': True
+                })
+
+    def export_all(self, output_dir: str):
+        os.makedirs(output_dir, exist_ok=True)
+        dl = {p['donor_id']: p for p in self.people.values()}
+
+        pd.DataFrame([{**hh, 'primary_contact_name': f"{dl.get(hh.get('primary_contact_id'), {}).get('first_name', '')} {dl.get(hh.get('primary_contact_id'), {}).get('last_name', '')}".strip()} for hh in self.households.values()]).to_csv(os.path.join(output_dir, 'master_households.csv'), index=False)
+        pd.DataFrame(self.people.values()).to_csv(os.path.join(output_dir, 'master_donors.csv'), index=False)
+        pd.DataFrame(self.organizations.values()).to_csv(os.path.join(output_dir, 'master_organizations.csv'), index=False)
+        pd.DataFrame([{**v, 'first_name': v.get('first_name') or self.people.get(v.get('_person_key'), {}).get('first_name')} for v in self.volunteer_records.values()]).to_csv(os.path.join(output_dir, 'master_volunteers.csv'), index=False)
+
+        if self.donations:
+            df_d = pd.DataFrame(self.donations)
+            df_d['donor_first_name'] = df_d['donor_id'].map(lambda id: dl.get(id, {}).get('first_name'))
+            df_d['donor_last_name'] = df_d['donor_id'].map(lambda id: dl.get(id, {}).get('last_name'))
+            df_d.to_csv(os.path.join(output_dir, 'master_donations.csv'), index=False)
+
+        if self.donor_org_affiliations: pd.DataFrame(self.donor_org_affiliations).to_csv(os.path.join(output_dir, 'master_donor_org_affiliations.csv'), index=False)
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    config = Config()
+    logger.info("=" * 60)
+    logger.info("HAYWOOD WATERWAYS - DATA CONSOLIDATION")
+    logger.info("=" * 60)
+
+    classified_files = scan_input_folder(config.INPUT_DIR)
+    if not classified_files: return
+
+    consolidator = MasterConsolidator(config)
+
+    process_map = {
+        'qgiv': ('process_qgiv', DataLoader.load_qgiv),
+        'quickbooks': ('process_quickbooks', None),
+        'old_names': ('process_old_names', DataLoader.load_old_names),
+        'volunteer_db': ('process_volunteer_db', None),
+        'sf_contacts': ('process_sf_contacts', DataLoader.load_sf_contacts),
+        'sf_accounts': ('process_sf_accounts', DataLoader.load_sf_accounts),
+        'sf_households': ('process_sf_households', None),
+    }
+
+    for source_type in sorted(classified_files.keys(), key=lambda x: SOURCE_PRIORITY.get(x, 99)):
+        method_name, loader_fn = process_map.get(source_type, (None, None))
+        processor = getattr(consolidator, method_name, None)
+        for filepath, df in classified_files[source_type]:
+            logger.info(f"\nProcessing {os.path.basename(filepath)} as {source_type}...")
+            filtered_df = loader_fn(filepath) if loader_fn else df
+            if filtered_df is not None: processor(filtered_df)
+
+    # Apply manual splits/org affiliations from JSON before deduping/households
+    consolidator.process_pending_resolutions()
+    consolidator.dedupe_donations()
+    consolidator.assign_households()
+    consolidator.calculate_memberships()
+
+    # THE CONTINGENCY CHECK
+    actionable_warnings = [w for w in consolidator.warnings if w.get('type') in ('REVIEW_NEEDED', 'EMAIL_CONFLICT', 'PHONE_CONFLICT', 'ADDRESS_CONFLICT')]
+
+    if actionable_warnings:
+        logger.warning(f"\n🛑 HALTING EXPORT: {len(actionable_warnings)} unresolved conflicts found.")
+        os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+        warn_path = os.path.join(config.OUTPUT_DIR, 'consolidation_warnings.csv')
+        try:
+            pd.DataFrame(consolidator.warnings).to_csv(warn_path, index=False)
+            logger.info(f"  1. Conflicts quarantined to {warn_path}")
+            logger.info("  2. Please run 'manual_reviewer.py' to resolve these.")
+        except PermissionError:
+            logger.error(f"\n❌ PERMISSION DENIED: Could not save {warn_path}.")
+            logger.error("Please close the file in Excel and run the script again.")
+        return
+
+    consolidator.export_all(config.OUTPUT_DIR)
+    logger.info("\nDONE! All conflicts resolved. Output saved.")
+
+if __name__ == "__main__":
+    main()

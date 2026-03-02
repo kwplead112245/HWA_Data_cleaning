@@ -1,0 +1,139 @@
+import pandas as pd
+import json
+import os
+import re
+
+OUTPUT_DIR = 'consolidated_output'
+WARNINGS_FILE = os.path.join(OUTPUT_DIR, 'consolidation_warnings.csv')
+RESOLUTIONS_FILE = os.path.join(OUTPUT_DIR, 'manual_resolutions.json')
+
+FREE_EMAIL_DOMAINS = {
+    'gmail.com', 'yahoo.com', 'hotmail.com', 'aol.com', 'outlook.com',
+    'icloud.com', 'me.com', 'mac.com', 'msn.com', 'live.com', 'bellsouth.net', 'charter.net'
+}
+
+
+def extract_domain(email):
+    """Extract domain from email, return None if it's a free provider or invalid."""
+    if not isinstance(email, str) or '@' not in email:
+        return None
+    domain = email.split('@')[-1].lower().strip()
+    if domain in FREE_EMAIL_DOMAINS:
+        return None
+    return domain
+
+
+def main():
+    if not os.path.exists(RESOLUTIONS_FILE) or not os.path.exists(WARNINGS_FILE):
+        print("❌ Could not find the resolutions JSON or warnings CSV. Make sure you've run the reviewer first.")
+        return
+
+    # 1. Load your existing decisions
+    with open(RESOLUTIONS_FILE, 'r') as f:
+        resolutions = json.load(f)
+
+    df = pd.read_csv(WARNINGS_FILE)
+
+    # 2. Extract Business Rules from your manual decisions
+    address_to_org = {}
+    domain_to_org = {}
+
+    print("🧠 Extracting rules from your manual reviews...")
+    for warning_id, res in resolutions.items():
+        if res.get('action') == 'keep_personal_and_affiliate':
+            org_name = res.get('org_name')
+            work_val = str(res.get('work_value')).lower().strip()
+            conflict_type = res.get('conflict_type')
+
+            if conflict_type == 'ADDRESS_CONFLICT':
+                # Memorize corporate address
+                address_to_org[work_val] = org_name
+                print(f"  Learned Address: '{work_val}' -> {org_name}")
+
+            elif conflict_type == 'EMAIL_CONFLICT':
+                # Memorize corporate email domain
+                domain = extract_domain(work_val)
+                if domain:
+                    domain_to_org[domain] = org_name
+                    print(f"  Learned Domain: '@{domain}' -> {org_name}")
+
+    if not address_to_org and not domain_to_org:
+        print("No extrapolatable rules found yet. Keep manually reviewing!")
+        return
+
+    # 3. Apply Rules to Unresolved Warnings
+    print("\n⚡ Applying rules to unresolved conflicts...")
+    auto_resolved_count = 0
+
+    for index, row in df.iterrows():
+        warning_id = f"{row.get('type')}_{row.get('donor_id', 'unknown')}_{index}"
+
+        # Skip if already resolved (either manually or in a previous run)
+        if warning_id in resolutions:
+            continue
+
+        c_type = row.get('type')
+        kept_val = str(row.get('kept_value')).lower().strip()
+        alt_val = str(row.get('alt_value')).lower().strip()
+
+        # Check for Address Match
+        if c_type == 'ADDRESS_CONFLICT':
+            if alt_val in address_to_org:
+                resolutions[warning_id] = {
+                    'action': 'keep_personal_and_affiliate',
+                    'org_name': address_to_org[alt_val],
+                    'personal_value': row.get('kept_value'),
+                    'work_value': row.get('alt_value'),
+                    'conflict_type': c_type,
+                    '_auto_resolved': True
+                }
+                auto_resolved_count += 1
+            elif kept_val in address_to_org:
+                resolutions[warning_id] = {
+                    'action': 'keep_personal_and_affiliate',
+                    'org_name': address_to_org[kept_val],
+                    'personal_value': row.get('alt_value'),
+                    'work_value': row.get('kept_value'),
+                    'conflict_type': c_type,
+                    '_auto_resolved': True
+                }
+                auto_resolved_count += 1
+
+        # Check for Email Domain Match
+        elif c_type == 'EMAIL_CONFLICT':
+            alt_domain = extract_domain(alt_val)
+            kept_domain = extract_domain(kept_val)
+
+            if alt_domain and alt_domain in domain_to_org:
+                resolutions[warning_id] = {
+                    'action': 'keep_personal_and_affiliate',
+                    'org_name': domain_to_org[alt_domain],
+                    'personal_value': row.get('kept_value'),
+                    'work_value': row.get('alt_value'),
+                    'conflict_type': c_type,
+                    '_auto_resolved': True
+                }
+                auto_resolved_count += 1
+            elif kept_domain and kept_domain in domain_to_org:
+                resolutions[warning_id] = {
+                    'action': 'keep_personal_and_affiliate',
+                    'org_name': domain_to_org[kept_domain],
+                    'personal_value': row.get('alt_value'),
+                    'work_value': row.get('kept_value'),
+                    'conflict_type': c_type,
+                    '_auto_resolved': True
+                }
+                auto_resolved_count += 1
+
+    # 4. Save back to the JSON file
+    if auto_resolved_count > 0:
+        with open(RESOLUTIONS_FILE, 'w') as f:
+            json.dump(resolutions, f, indent=4)
+        print(f"\n🎉 SUCCESS! Auto-resolved {auto_resolved_count} conflicts based on your previous decisions.")
+        print("Run your manual_reviewer.py again to see how many are left!")
+    else:
+        print("\nNo matching unresolved conflicts found for the learned rules.")
+
+
+if __name__ == "__main__":
+    main()
